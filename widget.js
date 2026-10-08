@@ -8,7 +8,7 @@
     return;
   }
 
-  console.log('AI Chat Widget v3 loaded');
+  console.log('AI Chat Widget v4 loaded');
 
   const STORAGE_KEY = 'ai_chat_customer_' + STORE_ID;
   const POLL_OPEN_MS = 4000;
@@ -17,8 +17,10 @@
   let customerId = null;
   let assistantName = 'AI Customer Service';
   let isOpen = false;
-  let sending = false;
+  let sending = false; // true while the send queue is being processed
   let pollTimer = null;
+  let typingEl = null;
+  const queue = [];
   const seen = {}; // chat log id -> { user: rendered?, ai: rendered? }
 
   const style = document.createElement('style');
@@ -33,6 +35,7 @@
     .aicw-msg.user { background: #2563eb; color: white; margin-left: auto; border-bottom-right-radius: 2px; }
     .aicw-msg.bot { background: white; color: #222; border: 1px solid #ddd; border-bottom-left-radius: 2px; }
     .aicw-msg.human { background: #ecfdf5; color: #222; border: 1px solid #a7f3d0; border-bottom-left-radius: 2px; }
+    .aicw-msg.typing { color: #888; letter-spacing: 2px; width: fit-content; }
     .aicw-options { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
     .aicw-option-btn { background: white; border: 1px solid #2563eb; color: #2563eb; border-radius: 8px; padding: 8px 12px; font-size: 13px; cursor: pointer; text-align: left; }
     .aicw-option-btn:hover { background: #eff6ff; }
@@ -90,12 +93,21 @@
     }
   });
 
+  // Keeps the typing indicator at the very bottom of the chat
+  function appendToMessages(el) {
+    if (typingEl && typingEl.parentNode === messagesEl) {
+      messagesEl.insertBefore(el, typingEl);
+    } else {
+      messagesEl.appendChild(el);
+    }
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
   function addMessage(text, sender) {
     const div = document.createElement('div');
     div.className = 'aicw-msg ' + sender;
     div.textContent = text;
-    messagesEl.appendChild(div);
-    messagesEl.scrollTop = messagesEl.scrollHeight;
+    appendToMessages(div);
   }
 
   function addOptions(options, promptText) {
@@ -112,8 +124,23 @@
       });
       wrap.appendChild(btn);
     });
-    messagesEl.appendChild(wrap);
+    appendToMessages(wrap);
+  }
+
+  function showTyping() {
+    if (typingEl) return;
+    typingEl = document.createElement('div');
+    typingEl.className = 'aicw-msg bot typing';
+    typingEl.textContent = '...';
+    messagesEl.appendChild(typingEl);
     messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  function hideTyping() {
+    if (typingEl) {
+      typingEl.remove();
+      typingEl = null;
+    }
   }
 
   function handleChatResponse(data) {
@@ -137,39 +164,47 @@
     return res.json();
   }
 
-  async function selectPromotion(promoId, title) {
-    if (sending) return;
-    sending = true;
-    addMessage(title, 'user');
-    try {
-      const data = await postChat({
-        store_id: STORE_ID,
-        customer_id: customerId,
-        message: '',
-        selected_promotion_id: promoId,
-      });
-      handleChatResponse(data);
-    } catch (e) {
-      addMessage('Sorry, something went wrong. Please try again.', 'bot');
-    } finally {
-      sending = false;
-    }
+  // Messages are sent one at a time, in order, so the backend always sees
+  // the earlier messages (and the car already mentioned) before the next one.
+  function enqueue(job) {
+    queue.push(job);
+    processQueue();
   }
 
-  async function sendMessage() {
-    const text = inputEl.value.trim();
-    if (!text || sending) return;
+  async function processQueue() {
+    if (sending) return;
     sending = true;
+    while (queue.length > 0) {
+      const job = queue.shift();
+      showTyping();
+      try {
+        const data = await job();
+        hideTyping();
+        handleChatResponse(data);
+      } catch (e) {
+        hideTyping();
+        addMessage('Sorry, something went wrong. Please try again.', 'bot');
+      }
+    }
+    sending = false;
+  }
+
+  function selectPromotion(promoId, title) {
+    addMessage(title, 'user');
+    enqueue(() => postChat({
+      store_id: STORE_ID,
+      customer_id: customerId,
+      message: '',
+      selected_promotion_id: promoId,
+    }));
+  }
+
+  function sendMessage() {
+    const text = inputEl.value.trim();
+    if (!text) return;
     addMessage(text, 'user');
     inputEl.value = '';
-    try {
-      const data = await postChat({ store_id: STORE_ID, customer_id: customerId, message: text });
-      handleChatResponse(data);
-    } catch (e) {
-      addMessage('Sorry, something went wrong. Please try again.', 'bot');
-    } finally {
-      sending = false;
-    }
+    enqueue(() => postChat({ store_id: STORE_ID, customer_id: customerId, message: text }));
   }
 
   sendBtn.addEventListener('click', sendMessage);
@@ -246,7 +281,7 @@
     if (!customerId || sending) return;
     try {
       const data = await fetchHistory();
-      if (sending) return; // drop data fetched while a message was being sent, to avoid duplicates
+      if (sending) return; // drop data fetched while messages were being sent, to avoid duplicates
       const gotReply = syncRows(data);
       if (gotReply && !isOpen) dot.style.display = 'block';
     } catch (e) {}
